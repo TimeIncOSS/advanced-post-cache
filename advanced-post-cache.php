@@ -27,22 +27,23 @@ class Advanced_Post_Cache {
 	/* Per query data */
 	var $cache_key = ''; // md5 of current SQL query
 	var $all_post_ids = false; // IDs of all posts current SQL query returns
-	var $cached_post_ids = array(); // subset of $all_post_ids whose posts are currently in cache
-	var $cached_posts = array();
 	var $found_posts = false; // The result of the FOUND_ROWS() query
-	var $cache_func = 'wp_cache_add'; // Turns to set if there seems to be inconsistencies
 
 	function __construct() {
-		// Specific to certain Memcached Object Cache plugins
-		if ( function_exists( 'wp_cache_add_group_prefix_map' ) ) {
-			wp_cache_add_group_prefix_map( $this->CACHE_GROUP_PREFIX, 'advanced_post_cache' );
-		}
 
 		$this->setup_for_blog();
 
 		add_action( 'switch_blog', array( $this, 'setup_for_blog' ), 10, 2 );
 
-		add_filter( 'posts_request', array( &$this, 'posts_request' ) ); // Short circuits if cached
+		add_action( 'clean_term_cache', array( &$this, 'flush_cache' ) );
+		add_action( 'clean_post_cache',  array( &$this, 'flush_cache' ) );
+
+		add_action( 'wp_updating_comment_count', 'dont_clear_advanced_post_cache' );
+		add_action( 'wp_update_comment_count', 'do_clear_advanced_post_cache' );
+
+		add_filter( 'split_the_query', '__return_true' );
+
+		add_filter( 'posts_request_ids', array( &$this, 'posts_request_ids' ) ); // Short circuits if cached
 		add_filter( 'posts_results', array( &$this, 'posts_results' ) ); // Collates if cached, primes cache if not
 
 		add_filter( 'post_limits_request', array(
@@ -104,6 +105,13 @@ class Advanced_Post_Cache {
 		$this->need_to_flush_cache = false;
 	}
 
+	function do_clear_advanced_post_cache() {
+		$this->do_flush_cache = true;
+	}
+
+	function dont_clear_advanced_post_cache() {
+		$this->do_flush_cache = false;
+	}
 
 	/* Cache Reading/Priming Functions */
 
@@ -112,47 +120,15 @@ class Advanced_Post_Cache {
 	 * If cached: Return query of needed post IDs.
 	 * Otherwise: Returns query unchanged.
 	 */
-	function posts_request( $sql ) {
-		global $wpdb;
+	function posts_request_ids( $sql ) {
 
 		$this->cache_key    = md5( $sql ); // init
 		$this->all_post_ids = wp_cache_get( $this->cache_key, $this->cache_group );
-		if ( 'NA' !== $this->found_posts ) {
-			$this->found_posts = wp_cache_get( "{$this->cache_key}_found", $this->cache_group );
-		}
-
-		if ( $this->all_post_ids xor $this->found_posts ) {
-			$this->cache_func = 'wp_cache_set';
-		} else {
-			$this->cache_func = 'wp_cache_add';
-		}
-
-		$this->cached_post_ids = array(); // re-init
-		$this->cached_posts    = array(); // re-init
+		$this->found_posts  = 0;
 
 		// Query is cached
-		if ( $this->found_posts && is_array( $this->all_post_ids ) ) {
-			if ( function_exists( 'wp_cache_get_multi' ) ) {
-				$this->cached_posts = wp_cache_get_multi( array( 'posts' => $this->all_post_ids ) );
-			} else {
-				$this->cached_posts = array();
-				foreach ( $this->all_post_ids as $pid ) {
-					$this->cached_posts[] = wp_cache_get( $pid, 'posts' );
-				}
-			}
-
-			$this->cached_posts = array_filter( $this->cached_posts );
-
-			foreach ( $this->cached_posts as $post ) {
-				if ( ! empty( $post ) ) {
-					$this->cached_post_ids[] = $post->ID;
-				}
-			}
-			$uncached_post_ids = array_diff( $this->all_post_ids, $this->cached_post_ids );
-
-			if ( $uncached_post_ids ) {
-				return "SELECT * FROM $wpdb->posts WHERE ID IN(" . join( ',', array_map( 'absint', $uncached_post_ids ) ) . ")";
-			}
+		if ( is_array( $this->all_post_ids ) ) {
+			$this->found_posts = count( $this->all_post_ids );
 
 			return '';
 		}
@@ -165,34 +141,14 @@ class Advanced_Post_Cache {
 	 * Otherwise: Primes cache with data for current posts WP_Query.
 	 */
 	function posts_results( $posts ) {
-		if ( $this->found_posts && is_array( $this->all_post_ids ) ) { // is cached
-			$collated_posts = array();
-			foreach ( $this->cached_posts as $post ) {
-				$posts[] = $post;
-			}
+		if ( is_array( $this->all_post_ids ) ) { // is cache
+			$posts = $this->all_post_ids;
+		} else {
+			$post_ids = wp_list_pluck( (array) $posts, 'ID' );
 
-			foreach ( $posts as $post ) {
-				$loc = array_search( $post->ID, $this->all_post_ids );
-				if ( is_numeric( $loc ) && - 1 < $loc ) {
-					$collated_posts[ $loc ] = $post;
-				}
-			}
-			ksort( $collated_posts );
-
-			return array_map( 'get_post', array_values( $collated_posts ) );
+			wp_cache_set( $this->cache_key, $post_ids, $this->cache_group );
+			$this->need_to_flush_cache = true;
 		}
-
-		$post_ids = array();
-		foreach ( (array) $posts as $post ) {
-			$post_ids[] = $post->ID;
-		}
-
-		if ( ! $post_ids ) {
-			return array();
-		}
-
-		call_user_func( $this->cache_func, $this->cache_key, $post_ids, $this->cache_group );
-		$this->need_to_flush_cache = true;
 
 		return array_map( 'get_post', $posts );
 	}
@@ -214,8 +170,8 @@ class Advanced_Post_Cache {
 	 * Otherwise: Returns query unchanged.
 	 */
 	function found_posts_query( $sql ) {
-		if ( $this->found_posts && is_array( $this->all_post_ids ) ) // is cached
-		{
+		// is cached
+		if ( $this->found_posts && is_array( $this->all_post_ids ) ) {
 			return '';
 		}
 
@@ -232,7 +188,6 @@ class Advanced_Post_Cache {
 			return (int) $this->found_posts;
 		}
 
-		call_user_func( $this->cache_func, "{$this->cache_key}_found", (int) $found_posts, $this->cache_group );
 		$this->need_to_flush_cache = true;
 
 		return $found_posts;
@@ -241,24 +196,3 @@ class Advanced_Post_Cache {
 
 global $advanced_post_cache_object;
 $advanced_post_cache_object = new Advanced_Post_Cache;
-
-function clear_advanced_post_cache() {
-	global $advanced_post_cache_object;
-	$advanced_post_cache_object->flush_cache();
-}
-
-function do_clear_advanced_post_cache() {
-	$GLOBALS['advanced_post_cache_object']->do_flush_cache = true;
-}
-
-function dont_clear_advanced_post_cache() {
-	$GLOBALS['advanced_post_cache_object']->do_flush_cache = false;
-}
-
-add_action( 'clean_term_cache', 'clear_advanced_post_cache' );
-add_action( 'clean_post_cache', 'clear_advanced_post_cache' );
-
-// Don't clear Advanced Post Cache for a new comment - temp core hack
-// http://core.trac.wordpress.org/ticket/15565
-add_action( 'wp_updating_comment_count', 'dont_clear_advanced_post_cache' );
-add_action( 'wp_update_comment_count', 'do_clear_advanced_post_cache' );
